@@ -1,0 +1,25 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# --- virtual environments ---
+.venv/
+venv/
+env/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- generated data and results ---
+# Run the program with:  --outdir out
+out/
+*.csv
+*.parquet
+
+# Exception: lightweight examples intentionally kept in the repo
+!examples/*.csv
