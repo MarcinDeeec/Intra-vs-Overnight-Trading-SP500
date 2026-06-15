@@ -1,0 +1,5 @@
+# Development / testing dependencies.
+# Installs the runtime dependencies too, so `pip install -r requirements-dev.txt`
+# is all you need for local testing and CI.
+-r requirements.txt
+pytest>=8.0

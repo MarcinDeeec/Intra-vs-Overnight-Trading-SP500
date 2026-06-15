@@ -1,5 +1,9 @@
 # S&P 500 — Overnight vs Intraday
 
+[![tests](https://github.com/MarcinDeeec/Intra-vs-Overnight-Trading-SP500/actions/workflows/tests.yml/badge.svg)](https://github.com/MarcinDeeec/Intra-vs-Overnight-Trading-SP500/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+
 Decomposes S&P 500 stock returns into an **overnight (ON)** and **intraday (ID)** component, with rankings, metadata (sector, market cap, volatility, beta) and statistical tests between groups.
 
 The project replicates a well-known market anomaly: historically, most of a stock's return is earned **outside trading hours** (between the close and the next open), not during the session.
@@ -74,6 +78,15 @@ python sp500_overnight_intraday.py --limit 10 --skip-meta --outdir out
 - **Survivorship bias**: we use *today's* index membership, so results are upward-biased (companies that dropped out of the S&P 500 are missing).
 - Results are **gross** — no transaction costs, taxes or slippage; executing at the exact open/close prices is not achievable in practice.
 - Companies with different history lengths: for comparisons use `--common-start` or the annualized columns.
+
+## Testing
+
+Unit tests cover the core ON/ID math (returns, log-additivity, cumulation and annualization) on synthetic data with known values.
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
 
 ## License
 
