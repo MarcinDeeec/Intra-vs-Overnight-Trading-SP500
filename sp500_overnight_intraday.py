@@ -1,139 +1,143 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-S&P 500 — Overnight (ON) vs Intraday (ID) decomposition
-=======================================================
+"""S&P 500 overnight (ON) vs intraday (ID) decomposition.
 
-What this script does:
-  1. Fetches the CURRENT S&P 500 constituents (from Wikipedia) with GICS sector.
-  2. Downloads daily adjusted OHLC from Yahoo Finance (yfinance).
-  3. For each session t computes:
-        ON_t = Open_t / Close_{t-1} - 1     (overnight)
-        ID_t = Close_t / Open_t   - 1       (intraday)
-  4. Computes CUMULATIVE ON and ID per company (product of (1+r)).
-  5. Builds rankings:
-        - ON >> ID  (like Micron / MU)
-        - ID >> ON
-        - ON ~ ID   (similar)
-  6. Adds metadata: sector, market cap, annualized volatility, beta.
-  7. Statistical tests: do groups (e.g. tech, small caps, high beta) have a
-     significantly different overnight profile (Welch t-test + Mann-Whitney)?
-  8. Saves results to CSV/Parquet, optional charts, and prints a summary.
+    ON_t = Open_t / Close_{t-1} - 1        ID_t = Close_t / Open_t - 1
 
-Requirements:
-    pip install yfinance pandas numpy scipy lxml pyarrow matplotlib
+Quick mode (a few tickers, ~seconds):
+    python sp500_overnight_intraday.py --tickers NVDA,MU,AAPL [--json]
+Full scan of the current S&P 500 (minutes):
+    python sp500_overnight_intraday.py --start 2015-01-01 --charts --outdir out
+Useful flags: --skip-meta (no market caps, faster), --limit N (smoke test),
+--common-start YYYY-MM-DD, --topx N, --json (machine-readable stdout).
 
-Usage:
-    python sp500_overnight_intraday.py --start 2015-01-01 --topx 25 --charts --outdir out
-
-Methodology notes:
-  - We use ADJUSTED prices (auto_adjust=True), so splits/dividends do not
-    artificially distort overnight gaps. ON and ID are then scaled consistently.
-  - 'Cumulative' = geometric product of (1+r). We also report the sum of log
-    returns, since log(1+ON)+log(1+ID) = log(1+close-to-close) is additive.
+Needs: pip install yfinance pandas numpy scipy lxml pyarrow matplotlib
+Adjusted prices, gross returns (no costs); full scans use TODAY's constituents
+(survivorship bias). Educational analysis, not investment advice.
 """
 
 import argparse
+import io
+import json
+import os
+import sys
 import time
 import warnings
 
 import numpy as np
 import pandas as pd
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+UA = ("sp500-overnight-intraday/1.1 "
+      "(+https://github.com/MarcinDeeec/Intra-vs-Overnight-Trading-SP500)")
+SIMILAR_BAND = 0.02  # |ON - ID| < 2 pp/yr (log) is labelled "similar"
+DISCLAIMER = ("Gross returns on adjusted Yahoo Finance prices; full scans use today's "
+              "S&P 500 members (survivorship bias). Educational, not investment advice.")
+RES_COLS = ["ticker", "sector", "cum_ON", "cum_ID", "ann_ON_pct", "ann_ID_pct",
+            "diff_log", "beta", "dominant"]
 
 
-# ----------------------------------------------------------------------------
+def log(*a):
+    """Progress/diagnostics go to stderr so stdout stays clean for --json."""
+    print(*a, file=sys.stderr, flush=True)
+
+
+def fail(msg, as_json=False, code=2):
+    if as_json:
+        print(json.dumps({"error": msg}))
+    log("ERROR: " + msg)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------------
 # 1. S&P 500 constituents
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _fetch_url_text(url, timeout=30):
-    """Fetch URL content with a browser User-Agent (Wikipedia blocks missing UA -> 403)."""
     import urllib.request
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
 
 def get_sp500_constituents():
     """Return DataFrame: ticker, name, sector, sub_industry."""
-    import io
-
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
-        html = _fetch_url_text(url)
-        tables = pd.read_html(io.StringIO(html))
-        df = tables[0].copy()
+        df = pd.read_html(io.StringIO(_fetch_url_text(url)))[0].copy()
     except Exception as e:
-        # Fallback: stable CSV mirror (datahub) with the same columns.
-        print(f"      (Wikipedia unavailable: {e}; using CSV mirror)", flush=True)
-        csv_url = (
-            "https://raw.githubusercontent.com/datasets/"
-            "s-and-p-500-companies/main/data/constituents.csv"
-        )
+        log(f"  (Wikipedia unavailable: {e}; using CSV mirror)")
+        csv_url = ("https://raw.githubusercontent.com/datasets/"
+                   "s-and-p-500-companies/main/data/constituents.csv")
         df = pd.read_csv(io.StringIO(_fetch_url_text(csv_url)))
-    df = df.rename(
-        columns={
-            "Symbol": "ticker",
-            "Security": "name",
-            "GICS Sector": "sector",
-            "GICS Sub-Industry": "sub_industry",
-        }
-    )
-    # Yahoo uses '-' instead of '.' (e.g. BRK.B -> BRK-B)
-    df["ticker"] = df["ticker"].str.replace(".", "-", regex=False).str.strip()
+    df = df.rename(columns={"Symbol": "ticker", "Security": "name",
+                            "GICS Sector": "sector", "GICS Sub-Industry": "sub_industry"})
+    df["ticker"] = df["ticker"].str.replace(".", "-", regex=False).str.strip()  # BRK.B -> BRK-B
     return df[["ticker", "name", "sector", "sub_industry"]].drop_duplicates("ticker")
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # 2. OHLC download
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+def _extract(data, t, single):
+    """One ticker's OHLCV frame from a yfinance download (handles every column layout)."""
+    cols = data.columns
+    if isinstance(cols, pd.MultiIndex):
+        if t in cols.get_level_values(0):
+            sub = data[t]
+        elif t in cols.get_level_values(1):
+            sub = data.xs(t, axis=1, level=1)
+        else:
+            return None
+    elif single:
+        sub = data
+    else:
+        return None
+    sub = sub.dropna(how="all")
+    if sub.empty or "Open" not in sub.columns or "Close" not in sub.columns:
+        return None
+    keep = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in sub.columns]
+    return sub[keep].copy()
+
+
 def download_ohlc(tickers, start, end=None, chunk=50, pause=1.0):
-    """Download adjusted OHLC in batches. Returns dict[ticker] -> DataFrame(Open,High,Low,Close,Volume)."""
+    """Adjusted daily OHLC in batches -> dict[ticker] -> DataFrame."""
     import yfinance as yf
 
     out = {}
     for i in range(0, len(tickers), chunk):
-        batch = tickers[i : i + chunk]
-        print(f"  downloading {i+1}-{i+len(batch)} / {len(tickers)} ...", flush=True)
-        data = yf.download(
-            batch,
-            start=start,
-            end=end,
-            interval="1d",
-            auto_adjust=True,
-            group_by="ticker",
-            threads=True,
-            progress=False,
-        )
+        batch = tickers[i:i + chunk]
+        log(f"  downloading {i + 1}-{i + len(batch)} / {len(tickers)} ...")
+        try:
+            data = yf.download(batch, start=start, end=end, interval="1d", auto_adjust=True,
+                               group_by="ticker", threads=True, progress=False)
+        except Exception as e:
+            log(f"  (batch failed: {e})")
+            continue
         for t in batch:
             try:
-                if len(batch) == 1:
-                    sub = data
-                else:
-                    sub = data[t]
-                sub = sub.dropna(how="all")
-                if sub.empty or "Open" not in sub or "Close" not in sub:
-                    continue
-                out[t] = sub[["Open", "High", "Low", "Close", "Volume"]].copy()
+                sub = _extract(data, t, single=len(batch) == 1)
             except Exception:
-                continue
-        time.sleep(pause)
+                sub = None
+            if sub is not None:
+                out[t] = sub
+        if i + chunk < len(tickers):
+            time.sleep(pause)
     return out
 
 
-# ----------------------------------------------------------------------------
-# 3-4. ON / ID and cumulative
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 3-4. ON / ID, cumulative, beta
+# ---------------------------------------------------------------------------
+def dominance(ann_diff_log):
+    if abs(ann_diff_log) < SIMILAR_BAND:
+        return "similar"
+    return "ON" if ann_diff_log > 0 else "ID"
+
+
 def compute_on_id(df):
-    """For a single company return a DataFrame with ON, ID and their logs."""
+    """For one company: ON, ID and their logs (first row is dropped: no previous close)."""
     d = df.copy()
     d["prev_close"] = d["Close"].shift(1)
     d["ON"] = d["Open"] / d["prev_close"] - 1.0
@@ -144,72 +148,71 @@ def compute_on_id(df):
     return d
 
 
-def summarize_ticker(t, d):
-    """Return a dict of cumulative/statistical metrics for one company."""
+def summarize_ticker(t, d, mkt_ret=None):
+    """Cumulative/statistical metrics for one company (None if < 20 sessions).
+
+    mkt_ret: optional Series of market (SPY) close-to-close returns -> beta.
+    """
     n = len(d)
     if n < 20:
         return None
-    cum_on = float(np.expm1(d["logON"].sum()))   # geometric cumulative ON
-    cum_id = float(np.expm1(d["logID"].sum()))   # geometric cumulative ID
-    sum_log_on = float(d["logON"].sum())
-    sum_log_id = float(d["logID"].sum())
     ann = 252.0
-    vol_on = float(d["ON"].std() * np.sqrt(ann))
-    vol_id = float(d["ID"].std() * np.sqrt(ann))
-    vol_c2c = float((d["Close"].pct_change().std()) * np.sqrt(ann))
+    s_on, s_id = float(d["logON"].sum()), float(d["logID"].sum())
+    c2c = d["Close"].pct_change()
+    beta = np.nan
+    if mkt_ret is not None:
+        j = pd.concat([c2c, mkt_ret], axis=1, join="inner").dropna()
+        if len(j) >= 60 and j.iloc[:, 1].var() > 0:
+            beta = float(j.iloc[:, 0].cov(j.iloc[:, 1]) / j.iloc[:, 1].var())
+    ann_diff = (s_on - s_id) / n * ann
     return {
         "ticker": t,
         "n_days": n,
-        "cum_ON": cum_on,
-        "cum_ID": cum_id,
-        "sum_logON": sum_log_on,
-        "sum_logID": sum_log_id,
-        "diff_log": sum_log_on - sum_log_id,   # >0 => ON dominates
-        # per-company annualization: mean daily log return * 252
-        "ann_ON_pct": float(np.expm1(sum_log_on / n * ann) * 100),
-        "ann_ID_pct": float(np.expm1(sum_log_id / n * ann) * 100),
-        "ann_diff_log": float((sum_log_on - sum_log_id) / n * ann),
+        "cum_ON": float(np.expm1(s_on)),
+        "cum_ID": float(np.expm1(s_id)),
+        "sum_logON": s_on,
+        "sum_logID": s_id,
+        "diff_log": s_on - s_id,                       # > 0 => ON dominates
+        "ann_ON_pct": float(np.expm1(s_on / n * ann) * 100),
+        "ann_ID_pct": float(np.expm1(s_id / n * ann) * 100),
+        "ann_diff_log": float(ann_diff),
         "mean_ON_bps": float(d["ON"].mean() * 1e4),
         "mean_ID_bps": float(d["ID"].mean() * 1e4),
-        "vol_ON": vol_on,
-        "vol_ID": vol_id,
-        "vol_close2close": vol_c2c,
+        "vol_ON": float(d["ON"].std() * np.sqrt(ann)),
+        "vol_ID": float(d["ID"].std() * np.sqrt(ann)),
+        "vol_close2close": float(c2c.std() * np.sqrt(ann)),
+        "beta": beta,
+        "dominant": dominance(ann_diff),
     }
 
 
-# ----------------------------------------------------------------------------
-# 6. Metadata (market cap, beta)
-# ----------------------------------------------------------------------------
-def fetch_meta(tickers, pause=0.0):
-    """Market cap + beta from yfinance (fast_info / info). Can be slow."""
+# ---------------------------------------------------------------------------
+# 6. Market caps (beta is computed from prices, see summarize_ticker)
+# ---------------------------------------------------------------------------
+def fetch_market_caps(tickers, workers=8):
     import yfinance as yf
+    from concurrent.futures import ThreadPoolExecutor
 
-    rows = []
-    for i, t in enumerate(tickers):
-        mc, beta = np.nan, np.nan
+    def one(t):
         try:
             tk = yf.Ticker(t)
-            fi = getattr(tk, "fast_info", {}) or {}
-            mc = fi.get("market_cap", np.nan)
-            if mc is None or (isinstance(mc, float) and np.isnan(mc)):
-                info = tk.info
-                mc = info.get("marketCap", np.nan)
-                beta = info.get("beta", np.nan)
+            mc = tk.fast_info.get("market_cap")
+            if not mc:
+                mc = tk.info.get("marketCap")
+            return t, float(mc) if mc else np.nan
         except Exception:
-            pass
-        rows.append({"ticker": t, "market_cap": mc, "beta": beta})
-        if (i + 1) % 50 == 0:
-            print(f"  metadata {i+1}/{len(tickers)}", flush=True)
-        if pause:
-            time.sleep(pause)
-    return pd.DataFrame(rows)
+            return t, np.nan
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        rows = list(ex.map(one, tickers))
+    return pd.DataFrame(rows, columns=["ticker", "market_cap"])
 
 
-# ----------------------------------------------------------------------------
-# 7. Statistical tests between groups
-# ----------------------------------------------------------------------------
-def group_tests(df, value_col="sum_logON"):
-    """Compare overnight profile between groups: tech vs rest, small vs large, high vs low beta."""
+# ---------------------------------------------------------------------------
+# 7. Group tests
+# ---------------------------------------------------------------------------
+def group_tests(df, value_col="mean_ON_bps"):
+    """Welch t-test + Mann-Whitney: tech / small cap / high beta vs the rest."""
     from scipy import stats
 
     results = []
@@ -219,199 +222,243 @@ def group_tests(df, value_col="sum_logON"):
         b = df.loc[~mask, value_col].dropna()
         if len(a) < 5 or len(b) < 5:
             return
-        tt = stats.ttest_ind(a, b, equal_var=False)   # Welch
+        tt = stats.ttest_ind(a, b, equal_var=False)
         mw = stats.mannwhitneyu(a, b, alternative="two-sided")
-        results.append(
-            {
-                "group": name,
-                "n_group": len(a),
-                "n_rest": len(b),
-                "mean_group": float(a.mean()),
-                "mean_rest": float(b.mean()),
-                "welch_t": float(tt.statistic),
-                "welch_p": float(tt.pvalue),
-                "mannwhitney_p": float(mw.pvalue),
-            }
-        )
+        results.append({"group": name, "n_group": len(a), "n_rest": len(b),
+                        "mean_group": float(a.mean()), "mean_rest": float(b.mean()),
+                        "welch_t": float(tt.statistic), "welch_p": float(tt.pvalue),
+                        "mannwhitney_p": float(mw.pvalue)})
 
-    # tech
     run("Tech (IT)", df["sector"].eq("Information Technology"))
-    # small caps = bottom market-cap quartile
     if df["market_cap"].notna().sum() > 20:
-        q = df["market_cap"].quantile(0.25)
-        run("Small cap (bottom mcap quartile)", df["market_cap"] <= q)
-    # high beta
+        run("Small cap (bottom mcap quartile)", df["market_cap"] <= df["market_cap"].quantile(0.25))
     if df["beta"].notna().sum() > 20:
-        bq = df["beta"].quantile(0.75)
-        run("High beta (top quartile)", df["beta"] >= bq)
-
+        run("High beta (top quartile)", df["beta"] >= df["beta"].quantile(0.75))
     return pd.DataFrame(results)
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Charts
-# ----------------------------------------------------------------------------
-def make_charts(res, outdir):
+# ---------------------------------------------------------------------------
+def make_charts(res, path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     df = res.copy()
-    sub_b = df[["ann_diff_log", "beta"]].dropna()
-    r_beta = np.corrcoef(sub_b.ann_diff_log, sub_b.beta)[0, 1] if len(sub_b) > 2 else float("nan")
-    sub_v = df[["ann_diff_log", "vol_close2close"]].dropna()
-    r_vol = np.corrcoef(sub_v.ann_diff_log, sub_v.vol_close2close)[0, 1] if len(sub_v) > 2 else float("nan")
+
+    def corr(col):
+        s = df[["ann_diff_log", col]].dropna()
+        return np.corrcoef(s.ann_diff_log, s[col])[0, 1] if len(s) > 2 else float("nan")
+
+    def scatter(ax, col, color, title, xlabel):
+        s = df[["ann_diff_log", col]].dropna()
+        ax.axhline(0, color="gray", ls=":")
+        if len(s) > 2:
+            ax.scatter(s[col], s.ann_diff_log, c=color, alpha=0.55, s=22)
+            xs = np.linspace(s[col].min(), s[col].max(), 50)
+            ax.plot(xs, np.polyval(np.polyfit(s[col], s.ann_diff_log, 1), xs), "k-", lw=2)
+        ax.set_title(f"{title} (r={corr(col):.2f})")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Annual ON-minus-ID advantage (log)")
 
     fig, ax = plt.subplots(2, 2, figsize=(15, 11))
-    fig.suptitle("S&P 500: overnight (ON) vs intraday (ID) decomposition — per-company annualization",
+    fig.suptitle("S&P 500: overnight (ON) vs intraday (ID) decomposition - per-company annualization",
                  fontsize=14, fontweight="bold")
-
     a = ax[0, 0]
-    lo, hi = -20, 60
-    a.hist(df.ann_ON_pct.clip(lo, hi), bins=40, alpha=0.6, label="Overnight (ON)", color="#2c7fb8")
-    a.hist(df.ann_ID_pct.clip(lo, hi), bins=40, alpha=0.6, label="Intraday (ID)", color="#de2d26")
+    a.hist(df.ann_ON_pct.clip(-20, 60), bins=40, alpha=0.6, label="Overnight (ON)", color="#2c7fb8")
+    a.hist(df.ann_ID_pct.clip(-20, 60), bins=40, alpha=0.6, label="Intraday (ID)", color="#de2d26")
     a.axvline(df.ann_ON_pct.median(), color="#2c7fb8", ls="--", lw=2)
     a.axvline(df.ann_ID_pct.median(), color="#de2d26", ls="--", lw=2)
-    a.set_title(f"Annualized return distribution (median ON={df.ann_ON_pct.median():.1f}%, ID={df.ann_ID_pct.median():.1f}%)")
-    a.set_xlabel("Annualized return [%]"); a.set_ylabel("Number of companies"); a.legend()
-
-    b = ax[0, 1]
-    if df.beta.notna().sum() > 5:
-        hi_beta = df.beta.quantile(0.75)
-        col = np.where(df.beta >= hi_beta, "#d95f02", "#7570b3")
-        b.scatter(df.beta, df.ann_diff_log, c=col, alpha=0.6, s=22)
-        m = df[["beta", "ann_diff_log"]].dropna()
-        z = np.polyfit(m.beta, m.ann_diff_log, 1)
-        xs = np.linspace(m.beta.min(), m.beta.max(), 50)
-        b.plot(xs, np.polyval(z, xs), "k-", lw=2)
-    b.axhline(0, color="gray", ls=":")
-    b.set_title(f"Beta vs ON advantage (r={r_beta:.2f}); orange = high beta")
-    b.set_xlabel("Beta"); b.set_ylabel("Annual ON-minus-ID advantage (log)")
-
-    c = ax[1, 0]
-    c.scatter(df.vol_close2close, df.ann_diff_log, c="#1b9e77", alpha=0.55, s=22)
-    m2 = df[["vol_close2close", "ann_diff_log"]].dropna()
-    z2 = np.polyfit(m2.vol_close2close, m2.ann_diff_log, 1)
-    xs2 = np.linspace(m2.vol_close2close.min(), m2.vol_close2close.max(), 50)
-    c.plot(xs2, np.polyval(z2, xs2), "k-", lw=2)
-    c.axhline(0, color="gray", ls=":")
-    c.set_title(f"Volatility vs ON advantage (r={r_vol:.2f})")
-    c.set_xlabel("Annualized volatility"); c.set_ylabel("Annual ON-minus-ID advantage (log)")
-
+    a.set_title(f"Annualized return (median ON={df.ann_ON_pct.median():.1f}%, "
+                f"ID={df.ann_ID_pct.median():.1f}%)")
+    a.set_xlabel("Annualized return [%]")
+    a.set_ylabel("Number of companies")
+    a.legend()
+    scatter(ax[0, 1], "beta", "#d95f02", "Beta vs ON advantage", "Beta (vs SPY, daily)")
+    scatter(ax[1, 0], "vol_close2close", "#1b9e77", "Volatility vs ON advantage", "Annualized volatility")
     d = ax[1, 1]
     g = df.groupby("sector").agg(ON=("ann_ON_pct", "mean"), ID=("ann_ID_pct", "mean")).sort_values("ON")
-    y = np.arange(len(g)); h = 0.4
+    y, h = np.arange(len(g)), 0.4
     d.barh(y + h / 2, g.ON, height=h, color="#2c7fb8", label="ON")
     d.barh(y - h / 2, g.ID, height=h, color="#de2d26", label="ID")
-    d.set_yticks(y); d.set_yticklabels(g.index, fontsize=9)
-    d.set_title("Mean annual ON vs ID by sector"); d.set_xlabel("Annualized return [%]"); d.legend()
-
+    d.set_yticks(y)
+    d.set_yticklabels(g.index, fontsize=9)
+    d.set_title("Mean annual ON vs ID by sector")
+    d.set_xlabel("Annualized return [%]")
+    d.legend()
     plt.tight_layout(rect=[0, 0, 1, 0.97])
-    plt.savefig(f"{outdir}/sp500_overnight_dashboard.png", dpi=130)
+    plt.savefig(path, dpi=130)
     plt.close(fig)
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+def to_records(df, cols=RES_COLS):
+    cols = [c for c in cols if c in df.columns]
+    return json.loads(df[cols].round(4).to_json(orient="records"))
+
+
+def _num(x):
+    return None if pd.isna(x) else round(float(x), 4)
+
+
+def _window(ohlc):
+    idx = [df.index for df in ohlc.values()]
+    return {"data_from": str(min(i.min() for i in idx).date()),
+            "data_to": str(max(i.max() for i in idx).date())}
+
+
+def _compute_all(ohlc, mkt_ret, common_start):
+    rows = []
+    for t, df in ohlc.items():
+        if common_start:
+            df = df[df.index >= pd.Timestamp(common_start)]
+            if len(df) < 21:
+                continue
+        s = summarize_ticker(t, compute_on_id(df), mkt_ret)
+        if s:
+            rows.append(s)
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Main
-# ----------------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser()
+# ---------------------------------------------------------------------------
+def build_parser():
+    ap = argparse.ArgumentParser(description="S&P 500 overnight vs intraday decomposition")
+    ap.add_argument("--tickers", default=None, help="comma-separated tickers (quick mode, skips the full scan)")
     ap.add_argument("--start", default="2015-01-01")
     ap.add_argument("--end", default=None)
     ap.add_argument("--topx", type=int, default=25)
-    ap.add_argument("--outdir", default=".")
-    ap.add_argument("--skip-meta", action="store_true", help="skip downloading market cap/beta")
-    ap.add_argument("--common-start", default=None, help="common window: truncate all series to this date (YYYY-MM-DD)")
-    ap.add_argument("--charts", action="store_true", help="save PNG charts (dashboard)")
+    ap.add_argument("--outdir", default=None, help="output dir (full scan default: out; quick mode: no files)")
+    ap.add_argument("--skip-meta", action="store_true", help="skip downloading market caps")
+    ap.add_argument("--common-start", default=None, help="truncate all series to this date (YYYY-MM-DD)")
+    ap.add_argument("--charts", action="store_true", help="save PNG dashboard (full scan)")
     ap.add_argument("--limit", type=int, default=None, help="limit number of companies (debug)")
-    args = ap.parse_args()
+    ap.add_argument("--json", action="store_true", help="print a compact JSON summary to stdout")
+    return ap
 
-    print("[1/6] S&P 500 constituents ...", flush=True)
-    cons = get_sp500_constituents()
-    if args.limit:
-        cons = cons.head(args.limit)
-    tickers = cons["ticker"].tolist()
-    print(f"      {len(tickers)} companies", flush=True)
 
-    print("[2/6] Downloading OHLC ...", flush=True)
-    ohlc = download_ohlc(tickers, start=args.start, end=args.end)
-    print(f"      data downloaded for {len(ohlc)} companies", flush=True)
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    quick = bool(args.tickers)
+    cons = None
 
-    print("[3/6] ON / ID + cumulative ...", flush=True)
-    summ = []
-    for t, df in ohlc.items():
-        if args.common_start:
-            df = df[df.index >= pd.Timestamp(args.common_start)]
-            if len(df) < 21:
-                continue
-        d = compute_on_id(df)
-        s = summarize_ticker(t, d)
-        if s:
-            summ.append(s)
-    res = pd.DataFrame(summ)
-    res = res.merge(cons, on="ticker", how="left")
-
-    if not args.skip_meta:
-        print("[4/6] Metadata (market cap, beta) ...", flush=True)
-        meta = fetch_meta(res["ticker"].tolist())
-        res = res.merge(meta, on="ticker", how="left")
+    if quick:
+        tickers = list(dict.fromkeys(t.strip().upper().replace(".", "-")
+                                     for t in args.tickers.split(",") if t.strip()))
+        if not tickers:
+            fail("--tickers is empty", args.json, 1)
     else:
+        log("[1/6] S&P 500 constituents ...")
+        try:
+            cons = get_sp500_constituents()
+        except Exception as e:
+            fail(f"could not fetch S&P 500 constituents ({e}); check the network or use --tickers", args.json)
+        if args.limit:
+            cons = cons.head(args.limit)
+        tickers = cons["ticker"].tolist()
+        log(f"      {len(tickers)} companies")
+
+    log("[2/6] Downloading OHLC ...")
+    ohlc = download_ohlc(tickers, start=args.start, end=args.end)
+    if not ohlc:
+        fail("no price data returned - network problem, Yahoo Finance rate limit, or wrong tickers", args.json)
+    missing = [t for t in tickers if t not in ohlc]
+    if missing:
+        log(f"      no data for: {', '.join(missing[:20])}{' ...' if len(missing) > 20 else ''}")
+    spy = download_ohlc(["SPY"], start=args.start, end=args.end).get("SPY")
+    mkt_ret = spy["Close"].pct_change() if spy is not None else None
+    if mkt_ret is None:
+        log("      (SPY unavailable: beta will be empty)")
+
+    log("[3/6] ON / ID + cumulative ...")
+    res = _compute_all(ohlc, mkt_ret, args.common_start)
+    if res.empty:
+        fail("no ticker had enough history (need >= 20 sessions)", args.json)
+    meta = _window(ohlc)
+
+    if quick:
+        res = res.sort_values("diff_log", ascending=False)
+        if args.outdir:
+            os.makedirs(args.outdir, exist_ok=True)
+            res.to_csv(os.path.join(args.outdir, "tickers_on_id.csv"), index=False)
+        if args.json:
+            print(json.dumps({"mode": "tickers", **meta, "missing": missing,
+                              "results": to_records(res), "disclaimer": DISCLAIMER}, indent=1))
+        else:
+            pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
+            cols = ["ticker", "n_days", "cum_ON", "cum_ID", "ann_ON_pct", "ann_ID_pct",
+                    "mean_ON_bps", "mean_ID_bps", "beta", "dominant"]
+            print(res[cols].to_string(index=False))
+            print(f"\n{DISCLAIMER}")
+        return 0
+
+    res = res.merge(cons, on="ticker", how="left")
+    if args.skip_meta:
         res["market_cap"] = np.nan
-        res["beta"] = np.nan
+    else:
+        log("[4/6] Market caps ...")
+        res = res.merge(fetch_market_caps(res["ticker"].tolist()), on="ticker", how="left")
 
-    # Classify ON vs ID based on the log-return difference
-    print("[5/6] Rankings ...", flush=True)
+    log("[5/6] Rankings ...")
     res = res.sort_values("diff_log", ascending=False)
-    on_dom = res.head(args.topx).copy()                          # ON >> ID
-    id_dom = res.sort_values("diff_log").head(args.topx).copy()   # ID >> ON
-    # similar: smallest |diff|
-    res["abs_diff"] = res["diff_log"].abs()
-    similar = res.sort_values("abs_diff").head(args.topx).copy()
+    on_dom = res.head(args.topx).copy()
+    id_dom = res.sort_values("diff_log").head(args.topx).copy()
+    similar = res.assign(abs_diff=res["diff_log"].abs()).sort_values("abs_diff").head(args.topx).drop(columns="abs_diff")
 
-    print("[6/6] Statistical tests ...", flush=True)
+    log("[6/6] Statistical tests ...")
     try:
-        tests = group_tests(res, value_col="sum_logON")
+        tests = group_tests(res)
     except Exception as e:
-        print(f"      (tests skipped: {e})", flush=True)
+        log(f"      (tests skipped: {e})")
         tests = pd.DataFrame()
 
-    # Save
-    od = args.outdir.rstrip("/")
-    res.drop(columns=["abs_diff"]).to_csv(f"{od}/sp500_on_id_all.csv", index=False)
-    on_dom.to_csv(f"{od}/rank_ON_dominates.csv", index=False)
-    id_dom.to_csv(f"{od}/rank_ID_dominates.csv", index=False)
-    similar.to_csv(f"{od}/rank_similar.csv", index=False)
+    od = args.outdir or "out"
+    os.makedirs(od, exist_ok=True)
+    files = {"sp500_on_id_all.csv": res, "rank_ON_dominates.csv": on_dom,
+             "rank_ID_dominates.csv": id_dom, "rank_similar.csv": similar}
     if not tests.empty:
-        tests.to_csv(f"{od}/group_tests.csv", index=False)
+        files["group_tests.csv"] = tests
+    for name, frame in files.items():
+        frame.to_csv(os.path.join(od, name), index=False)
     try:
-        res.drop(columns=["abs_diff"]).to_parquet(f"{od}/sp500_on_id_all.parquet")
+        res.to_parquet(os.path.join(od, "sp500_on_id_all.parquet"))
     except Exception:
         pass
-
-    # Console summary
-    pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
-    cols = ["ticker", "sector", "cum_ON", "cum_ID", "diff_log", "vol_close2close"]
-    print("\n=== TOP: ON >> ID (overnight dominates, like MU) ===")
-    print(on_dom[cols].to_string(index=False))
-    print("\n=== TOP: ID >> ON (intraday dominates) ===")
-    print(id_dom[cols].to_string(index=False))
-    print("\n=== Similar (ON ~ ID) ===")
-    print(similar[cols].to_string(index=False))
-    if not tests.empty:
-        print("\n=== Tests: does the group have a different overnight profile (sum_logON) ===")
-        print(tests.to_string(index=False))
-
     if args.charts:
-        print("      saving charts ...", flush=True)
         try:
-            make_charts(res, od)
-            print("      saved: sp500_overnight_dashboard.png", flush=True)
+            make_charts(res, os.path.join(od, "sp500_overnight_dashboard.png"))
+            files["sp500_overnight_dashboard.png"] = None
         except Exception as e:
-            print(f"      (charts skipped: {e})", flush=True)
+            log(f"      (charts skipped: {e})")
 
-    print(f"\nDone. Files saved in: {od}/")
-    print("  sp500_on_id_all.csv / .parquet, rank_*.csv, group_tests.csv")
+    if args.json:
+        print(json.dumps({
+            "mode": "scan", **meta, "n_companies": len(res), "missing_count": len(missing),
+            "median_ann_ON_pct": _num(res["ann_ON_pct"].median()),
+            "median_ann_ID_pct": _num(res["ann_ID_pct"].median()),
+            "on_dominates": to_records(on_dom), "id_dominates": to_records(id_dom),
+            "similar": to_records(similar),
+            "group_tests": to_records(tests, list(tests.columns)) if not tests.empty else [],
+            "outdir": od, "files": sorted(files), "disclaimer": DISCLAIMER}, indent=1))
+    else:
+        pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
+        cols = ["ticker", "sector", "cum_ON", "cum_ID", "diff_log", "vol_close2close"]
+        print("\n=== TOP: ON >> ID (overnight dominates) ===")
+        print(on_dom[cols].to_string(index=False))
+        print("\n=== TOP: ID >> ON (intraday dominates) ===")
+        print(id_dom[cols].to_string(index=False))
+        print("\n=== Similar (ON ~ ID) ===")
+        print(similar[cols].to_string(index=False))
+        if not tests.empty:
+            print("\n=== Group tests on mean daily overnight return (bps) ===")
+            print(tests.to_string(index=False))
+        print(f"\nDone. Files saved in: {od}/\n{DISCLAIMER}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

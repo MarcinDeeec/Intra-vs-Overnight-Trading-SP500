@@ -23,3 +23,6 @@ out/
 
 # Exception: lightweight examples intentionally kept in the repo
 !examples/*.csv
+
+# --- skill package build output ---
+dist/
