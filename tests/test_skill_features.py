@@ -128,7 +128,7 @@ def test_fetch_market_caps_falls_back_to_info_and_survives_errors(monkeypatch):
 
 # ------------------------------------------------------------------- CLI
 def _fake_download(missing=()):
-    def fake(tickers, start, end=None, chunk=50, pause=1.0):
+    def fake(tickers, start, end=None, chunk=50, pause=1.0, quiet=False):
         out = {}
         for i, t in enumerate(tickers):
             if t in missing:
@@ -209,3 +209,83 @@ def test_constituents_failure_is_reported(monkeypatch, capsys):
         mod.main(["--json"])
     assert e.value.code == 2
     assert "constituents" in json.loads(capsys.readouterr().out)["error"]
+
+
+# ------------------------------------------------- unfinished US session
+def _bars(last_day):
+    idx = pd.bdate_range(end=last_day, periods=30)
+    return pd.DataFrame({"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0}, index=idx)
+
+
+@pytest.mark.parametrize("now, dropped", [
+    ("2026-11-18 15:00", True),     # Wednesday, market still open -> today's bar is live
+    ("2026-11-18 09:00", True),     # pre-market: a stray bar for today must not be trusted either
+    ("2026-11-18 16:45", False),    # after the close (+ Yahoo delay) -> finished bar
+    ("2026-11-21 12:00", False),    # Saturday: last bar is Friday's
+])
+def test_drop_open_session(now, dropped):
+    data = {"AAA": _bars("2026-11-18") if now.startswith("2026-11-18") else _bars("2026-11-20")}
+    out, day = mod._drop_open_session(data, now=pd.Timestamp(now, tz="America/New_York"))
+    assert len(out["AAA"]) == (29 if dropped else 30)
+    assert day == ("2026-11-18" if dropped else None)
+
+
+def test_drop_open_session_keeps_older_last_bar_and_removes_empty_frames():
+    now = pd.Timestamp("2026-11-18 12:00", tz="America/New_York")
+    out, day = mod._drop_open_session({"OLD": _bars("2026-11-17"), "ONE": _bars("2026-11-18").iloc[-1:]}, now=now)
+    assert len(out["OLD"]) == 30 and "ONE" not in out and day == "2026-11-18"
+
+
+def test_main_reports_dropped_session_and_beta_still_aligned(monkeypatch, capsys):
+    monkeypatch.setattr(mod, "download_ohlc", _fake_download())
+    monkeypatch.setattr(mod, "_now_et", lambda: pd.Timestamp("2022-06-01 11:00", tz="America/New_York"))
+    assert mod.main(["--tickers", "AAA", "--json"]) == 0
+    cap = capsys.readouterr()
+    payload = json.loads(cap.out)
+    last_bar = _series().index[-1]                     # synthetic data ends 2023-02-24, never "today"
+    assert payload["partial_session_dropped"] is None and payload["data_to"] == str(last_bar.date())
+    monkeypatch.setattr(mod, "_now_et", lambda: pd.Timestamp(last_bar.date(), tz="America/New_York")
+                        + pd.Timedelta(hours=11))
+    assert mod.main(["--tickers", "AAA", "--json"]) == 0
+    cap = capsys.readouterr()
+    payload = json.loads(cap.out)
+    assert payload["partial_session_dropped"] == str(last_bar.date())
+    assert payload["data_to"] < str(last_bar.date()) and "unfinished session" in cap.err
+
+
+# ------------------------------------------------ rankings, notes, steps
+def test_rankings_and_label_use_the_same_annualized_measure(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(mod, "download_ohlc", _fake_download())
+    monkeypatch.setattr(mod, "get_sp500_constituents", _fake_constituents)
+    assert mod.main(["--skip-meta", "--json", "--topx", "12", "--outdir", str(tmp_path)]) == 0
+    p = json.loads(capsys.readouterr().out)
+    on = [r["ann_diff_log"] for r in p["on_dominates"]]
+    idm = [r["ann_diff_log"] for r in p["id_dominates"]]
+    sim = [abs(r["ann_diff_log"]) for r in p["similar"]]
+    assert on == sorted(on, reverse=True) and idm == sorted(idm) and sim == sorted(sim)
+
+
+def test_group_tests_note_explains_empty_result_only_when_empty(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(mod, "download_ohlc", _fake_download())
+    monkeypatch.setattr(mod, "get_sp500_constituents", lambda: _fake_constituents(8))
+    assert mod.main(["--skip-meta", "--json", "--limit", "8", "--outdir", str(tmp_path)]) == 0
+    p = json.loads(capsys.readouterr().out)
+    assert p["group_tests"] == [] and "run a larger scan" in p["group_tests_note"]
+    monkeypatch.setattr(mod, "get_sp500_constituents", _fake_constituents)
+    assert mod.main(["--skip-meta", "--json", "--outdir", str(tmp_path)]) == 0
+    assert json.loads(capsys.readouterr().out)["group_tests_note"] is None
+
+
+@pytest.mark.parametrize("argv, last", [
+    (["--tickers", "AAA"], "[2/2]"),
+    (["--skip-meta"], "[5/5]"),
+    ([], "[6/6]"),
+])
+def test_step_numbers_are_consecutive_and_end_at_total(monkeypatch, capsys, tmp_path, argv, last):
+    monkeypatch.setattr(mod, "download_ohlc", _fake_download())
+    monkeypatch.setattr(mod, "get_sp500_constituents", _fake_constituents)
+    monkeypatch.setattr(mod, "fetch_market_caps", lambda ts: pd.DataFrame({"ticker": ts, "market_cap": 1e9}))
+    assert mod.main(argv + ["--json", "--outdir", str(tmp_path)]) == 0
+    steps = [ln.split("]")[0] + "]" for ln in capsys.readouterr().err.splitlines() if ln.startswith("[")]
+    total = last.split("/")[1]
+    assert steps == [f"[{i}/{total}" for i in range(1, len(steps) + 1)] and steps[-1] == last

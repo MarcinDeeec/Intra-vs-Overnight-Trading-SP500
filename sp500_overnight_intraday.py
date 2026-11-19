@@ -29,13 +29,13 @@ import pandas as pd
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-UA = ("sp500-overnight-intraday/1.1 "
+UA = ("sp500-overnight-intraday/1.2 "
       "(+https://github.com/MarcinDeeec/Intra-vs-Overnight-Trading-SP500)")
 SIMILAR_BAND = 0.02  # |ON - ID| < 2 pp/yr (log) is labelled "similar"
 DISCLAIMER = ("Gross returns on adjusted Yahoo Finance prices; full scans use today's "
               "S&P 500 members (survivorship bias). Educational, not investment advice.")
 RES_COLS = ["ticker", "sector", "cum_ON", "cum_ID", "ann_ON_pct", "ann_ID_pct",
-            "diff_log", "beta", "dominant"]
+            "ann_diff_log", "beta", "dominant"]
 
 
 def log(*a):
@@ -50,9 +50,7 @@ def fail(msg, as_json=False, code=2):
     sys.exit(code)
 
 
-# ---------------------------------------------------------------------------
-# 1. S&P 500 constituents
-# ---------------------------------------------------------------------------
+# --- 1. S&P 500 constituents ---
 def _fetch_url_text(url, timeout=30):
     import urllib.request
 
@@ -77,9 +75,7 @@ def get_sp500_constituents():
     return df[["ticker", "name", "sector", "sub_industry"]].drop_duplicates("ticker")
 
 
-# ---------------------------------------------------------------------------
-# 2. OHLC download
-# ---------------------------------------------------------------------------
+# --- 2. OHLC download ---
 def _extract(data, t, single):
     """One ticker's OHLCV frame from a yfinance download (handles every column layout)."""
     cols = data.columns
@@ -101,14 +97,15 @@ def _extract(data, t, single):
     return sub[keep].copy()
 
 
-def download_ohlc(tickers, start, end=None, chunk=50, pause=1.0):
+def download_ohlc(tickers, start, end=None, chunk=50, pause=1.0, quiet=False):
     """Adjusted daily OHLC in batches -> dict[ticker] -> DataFrame."""
     import yfinance as yf
 
     out = {}
     for i in range(0, len(tickers), chunk):
         batch = tickers[i:i + chunk]
-        log(f"  downloading {i + 1}-{i + len(batch)} / {len(tickers)} ...")
+        if not quiet:
+            log(f"  downloading {i + 1}-{i + len(batch)} / {len(tickers)} ...")
         try:
             data = yf.download(batch, start=start, end=end, interval="1d", auto_adjust=True,
                                group_by="ticker", threads=True, progress=False)
@@ -127,9 +124,7 @@ def download_ohlc(tickers, start, end=None, chunk=50, pause=1.0):
     return out
 
 
-# ---------------------------------------------------------------------------
-# 3-4. ON / ID, cumulative, beta
-# ---------------------------------------------------------------------------
+# --- 3-4. ON / ID, cumulative, beta ---
 def dominance(ann_diff_log):
     if abs(ann_diff_log) < SIMILAR_BAND:
         return "similar"
@@ -186,9 +181,7 @@ def summarize_ticker(t, d, mkt_ret=None):
     }
 
 
-# ---------------------------------------------------------------------------
-# 6. Market caps (beta is computed from prices, see summarize_ticker)
-# ---------------------------------------------------------------------------
+# --- 6. Market caps (beta is computed from prices, see summarize_ticker) ---
 def fetch_market_caps(tickers, workers=8):
     import yfinance as yf
     from concurrent.futures import ThreadPoolExecutor
@@ -208,9 +201,7 @@ def fetch_market_caps(tickers, workers=8):
     return pd.DataFrame(rows, columns=["ticker", "market_cap"])
 
 
-# ---------------------------------------------------------------------------
-# 7. Group tests
-# ---------------------------------------------------------------------------
+# --- 7. Group tests ---
 def group_tests(df, value_col="mean_ON_bps"):
     """Welch t-test + Mann-Whitney: tech / small cap / high beta vs the rest."""
     from scipy import stats
@@ -237,9 +228,7 @@ def group_tests(df, value_col="mean_ON_bps"):
     return pd.DataFrame(results)
 
 
-# ---------------------------------------------------------------------------
-# Charts
-# ---------------------------------------------------------------------------
+# --- Charts ---
 def make_charts(res, path):
     import matplotlib
     matplotlib.use("Agg")
@@ -292,9 +281,7 @@ def make_charts(res, path):
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Output helpers
-# ---------------------------------------------------------------------------
+# --- Output helpers ---
 def to_records(df, cols=RES_COLS):
     cols = [c for c in cols if c in df.columns]
     return json.loads(df[cols].round(4).to_json(orient="records"))
@@ -302,6 +289,30 @@ def to_records(df, cols=RES_COLS):
 
 def _num(x):
     return None if pd.isna(x) else round(float(x), 4)
+
+
+def _now_et():
+    return pd.Timestamp.now(tz="America/New_York")
+
+
+def _drop_open_session(ohlc, now=None):
+    """Drop today's bar while the US market is still open (it holds a live price, not a close).
+
+    Returns (ohlc, dropped_date_or_None). Cutoff 16:30 ET = close plus Yahoo's delay.
+    """
+    try:
+        now = now if now is not None else _now_et()
+    except Exception:
+        return ohlc, None
+    if now.weekday() >= 5 or now.hour * 60 + now.minute >= 16 * 60 + 30:
+        return ohlc, None
+    out, dropped = {}, None
+    for t, df in ohlc.items():
+        if len(df) and pd.Timestamp(df.index[-1]).date() == now.date():
+            df, dropped = df.iloc[:-1], str(now.date())
+        if len(df):
+            out[t] = df
+    return out, dropped
 
 
 def _window(ohlc):
@@ -323,9 +334,7 @@ def _compute_all(ohlc, mkt_ret, common_start):
     return pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# --- Main ---
 def build_parser():
     ap = argparse.ArgumentParser(description="S&P 500 overnight vs intraday decomposition")
     ap.add_argument("--tickers", default=None, help="comma-separated tickers (quick mode, skips the full scan)")
@@ -345,6 +354,11 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     quick = bool(args.tickers)
     cons = None
+    steps = [0, 2 if quick else (5 if args.skip_meta else 6)]
+
+    def step(msg):
+        steps[0] += 1
+        log(f"[{steps[0]}/{steps[1]}] {msg}")
 
     if quick:
         tickers = list(dict.fromkeys(t.strip().upper().replace(".", "-")
@@ -352,7 +366,7 @@ def main(argv=None):
         if not tickers:
             fail("--tickers is empty", args.json, 1)
     else:
-        log("[1/6] S&P 500 constituents ...")
+        step("S&P 500 constituents ...")
         try:
             cons = get_sp500_constituents()
         except Exception as e:
@@ -362,26 +376,31 @@ def main(argv=None):
         tickers = cons["ticker"].tolist()
         log(f"      {len(tickers)} companies")
 
-    log("[2/6] Downloading OHLC ...")
+    step("Downloading OHLC ...")
     ohlc = download_ohlc(tickers, start=args.start, end=args.end)
     if not ohlc:
         fail("no price data returned - network problem, Yahoo Finance rate limit, or wrong tickers", args.json)
     missing = [t for t in tickers if t not in ohlc]
     if missing:
         log(f"      no data for: {', '.join(missing[:20])}{' ...' if len(missing) > 20 else ''}")
-    spy = download_ohlc(["SPY"], start=args.start, end=args.end).get("SPY")
+    spy = download_ohlc(["SPY"], start=args.start, end=args.end, quiet=True).get("SPY")
+    ohlc, partial = _drop_open_session(ohlc)
+    if partial:
+        log(f"      dropped today's unfinished session ({partial}): US market still open")
+    if spy is not None:
+        spy = _drop_open_session({"SPY": spy})[0].get("SPY")
     mkt_ret = spy["Close"].pct_change() if spy is not None else None
     if mkt_ret is None:
         log("      (SPY unavailable: beta will be empty)")
 
-    log("[3/6] ON / ID + cumulative ...")
+    step("Computing ON / ID ...")
     res = _compute_all(ohlc, mkt_ret, args.common_start)
     if res.empty:
         fail("no ticker had enough history (need >= 20 sessions)", args.json)
-    meta = _window(ohlc)
+    meta = {**_window(ohlc), "partial_session_dropped": partial}
 
     if quick:
-        res = res.sort_values("diff_log", ascending=False)
+        res = res.sort_values("ann_diff_log", ascending=False)
         if args.outdir:
             os.makedirs(args.outdir, exist_ok=True)
             res.to_csv(os.path.join(args.outdir, "tickers_on_id.csv"), index=False)
@@ -400,21 +419,27 @@ def main(argv=None):
     if args.skip_meta:
         res["market_cap"] = np.nan
     else:
-        log("[4/6] Market caps ...")
+        step("Market caps ...")
         res = res.merge(fetch_market_caps(res["ticker"].tolist()), on="ticker", how="left")
 
-    log("[5/6] Rankings ...")
-    res = res.sort_values("diff_log", ascending=False)
+    step("Rankings ...")
+    res = res.sort_values("ann_diff_log", ascending=False)
     on_dom = res.head(args.topx).copy()
-    id_dom = res.sort_values("diff_log").head(args.topx).copy()
-    similar = res.assign(abs_diff=res["diff_log"].abs()).sort_values("abs_diff").head(args.topx).drop(columns="abs_diff")
+    id_dom = res.sort_values("ann_diff_log").head(args.topx).copy()
+    similar = (res.assign(abs_diff=res["ann_diff_log"].abs()).sort_values("abs_diff")
+               .head(args.topx).drop(columns="abs_diff"))
 
-    log("[6/6] Statistical tests ...")
+    step("Statistical tests ...")
     try:
         tests = group_tests(res)
     except Exception as e:
         log(f"      (tests skipped: {e})")
         tests = pd.DataFrame()
+    note = None
+    if tests.empty:
+        note = ("no group tests ran: each group needs >= 5 companies, and the beta / market-cap "
+                "tests need > 20 values - run a larger scan")
+        log("      " + note)
 
     od = args.outdir or "out"
     os.makedirs(od, exist_ok=True)
@@ -443,10 +468,11 @@ def main(argv=None):
             "on_dominates": to_records(on_dom), "id_dominates": to_records(id_dom),
             "similar": to_records(similar),
             "group_tests": to_records(tests, list(tests.columns)) if not tests.empty else [],
+            "group_tests_note": note,
             "outdir": od, "files": sorted(files), "disclaimer": DISCLAIMER}, indent=1))
     else:
         pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
-        cols = ["ticker", "sector", "cum_ON", "cum_ID", "diff_log", "vol_close2close"]
+        cols = ["ticker", "sector", "cum_ON", "cum_ID", "ann_diff_log", "vol_close2close"]
         print("\n=== TOP: ON >> ID (overnight dominates) ===")
         print(on_dom[cols].to_string(index=False))
         print("\n=== TOP: ID >> ON (intraday dominates) ===")
