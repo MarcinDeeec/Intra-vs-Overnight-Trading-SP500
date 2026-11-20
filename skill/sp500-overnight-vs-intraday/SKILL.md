@@ -60,10 +60,14 @@ Progress and warnings go to stderr; with `--json` stdout is a single JSON docume
 Quick mode JSON: `results[]` with, per ticker, `cum_ON`, `cum_ID` (cumulative returns, 0.5 = +50%),
 `ann_ON_pct`, `ann_ID_pct` (annualized, %), `mean_ON_bps`, `mean_ID_bps` (average daily, basis points),
 `beta` (vs SPY, daily), and `dominant`: `"ON"`, `"ID"` or `"similar"` (within 2 pp/year of each other).
-Also `missing[]` (tickers with no data - usually typos or delisted), `data_from`, `data_to`.
+Also `missing[]` (tickers with no data - usually typos or delisted), `data_from`, `data_to`, and
+`partial_session_dropped` (a date, or null): while the US market is open the script drops today's unfinished
+bar automatically, because a live price is not a close. Mention it if it is set.
 
-Scan JSON: `on_dominates`, `id_dominates`, `similar` (top-N lists), `group_tests` (tech, small cap,
-high beta vs the rest: Welch and Mann-Whitney p-values on the mean daily overnight return),
+Scan JSON: `on_dominates`, `id_dominates`, `similar` (top-N lists, ranked by `ann_diff_log`, the annualized
+ON-minus-ID advantage, so history length does not matter), `group_tests` (tech, small cap,
+high beta vs the rest: Welch and Mann-Whitney p-values on the mean daily overnight return;
+if empty, `group_tests_note` says why, usually a scan that was too small),
 `median_ann_ON_pct` / `median_ann_ID_pct`, `n_companies`, and `files` written to `outdir`
 (CSV/Parquet, and `sp500_overnight_dashboard.png` with `--charts`).
 
@@ -73,6 +77,9 @@ high beta vs the rest: Welch and Mann-Whitney p-values on the mean daily overnig
 - Always state the caveats that apply: results are **gross** (no costs, spreads or taxes; trading exactly at
   the open and close is not achievable), prices are **adjusted** Yahoo data, and full scans use **today's**
   index members (survivorship bias inflates results).
+- Large overnight returns, especially for growth stocks (e.g. NVDA, MU, AMD), often reflect earnings releases and
+  news that come out while the market is closed, i.e. a few big gaps rather than a steady premium. Say so
+  when ON dominates strongly.
 - A "significant" p-value describes this sample, not the future. Several tests are run; do not oversell them.
 - Present this as analysis, never as a trade recommendation or investment advice.
 - If tickers are in `missing`, tell the user which ones and suggest checking the spelling

@@ -13,7 +13,8 @@ Weekends and holidays are part of the overnight gap.
 
 ## Aggregates (per company)
 - `cum_ON`, `cum_ID`: geometric cumulation, `prod(1 + r) - 1`. Computed as `expm1(sum(log1p(r)))`.
-- `diff_log` = `sum(log ON) - sum(log ID)`: positive means overnight dominates over the whole sample.
+- `diff_log` = `sum(log ON) - sum(log ID)`: positive means overnight dominates over the whole sample. It grows
+  with history length, so it is kept in the CSV but not used for rankings.
 - `ann_ON_pct`, `ann_ID_pct`: mean daily log return x 252, converted back to a percentage.
   Use these (not the cumulative values) to compare companies with different history lengths.
 - `ann_diff_log`: `diff_log` annualized the same way. `dominant` is `"ON"` / `"ID"` when
@@ -26,7 +27,9 @@ Weekends and holidays are part of the overnight gap.
 - Companies with fewer than 20 sessions are skipped.
 
 ## Rankings (full scan)
-`on_dominates` = top N by `diff_log`; `id_dominates` = bottom N; `similar` = N smallest `|diff_log|`.
+All three use `ann_diff_log` (the annualized ON-minus-ID advantage, same measure as the `dominant` label):
+`on_dominates` = top N; `id_dominates` = bottom N; `similar` = N smallest `|ann_diff_log|`.
+If no group test could run, `group_tests_note` explains why.
 
 ## Group tests (full scan)
 Compares the mean daily overnight return (`mean_ON_bps`) of a group with the rest of the index using
@@ -43,4 +46,8 @@ and no multiple-testing correction is applied.
 - **Data quality**: Yahoo's daily `Open` is not guaranteed to be the official opening-auction price, and
   adjusted history can be revised. Different vendors give slightly different ON/ID splits.
 - **History**: results depend on the chosen window; the anomaly is not stable across periods or markets.
+- **Earnings and news gaps**: companies usually report results outside trading hours, so a large ON for
+  growth stocks can be driven by a handful of earnings-day gaps rather than a steady overnight premium.
+- **Unfinished session**: while the US market is open (before 16:30 ET) Yahoo's bar for today holds a live
+  price, not a close. The script drops it automatically and reports the date in `partial_session_dropped`.
 - **Not advice**: educational analysis only.

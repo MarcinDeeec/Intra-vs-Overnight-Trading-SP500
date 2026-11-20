@@ -24,7 +24,7 @@ Cumulative returns are computed as the geometric product of `(1 + r)` (and also 
 - Fetches the **current S&P 500 constituents** from Wikipedia (with a CSV-mirror fallback) including GICS sector.
 - Downloads daily **adjusted OHLC** from Yahoo Finance (`yfinance`).
 - Computes cumulative and **annualized** ON and ID per company.
-- Builds 3 rankings: `ON >> ID`, `ID >> ON`, `ON ~ ID`.
+- Builds 3 rankings: `ON >> ID`, `ID >> ON`, `ON ~ ID` (ranked by the annualized ON-minus-ID advantage `ann_diff_log`, so history length does not matter).
 - Adds sector, market cap, volatility (ON/ID/close-to-close) and **beta vs SPY** (computed from daily close-to-close returns, so it needs no extra per-ticker requests).
 - Statistical tests (Welch t-test + Mann-Whitney) on the mean daily overnight return: do tech / small caps / high beta have a different overnight profile.
 - **Quick mode** (`--tickers`) for a handful of tickers in seconds, and `--json` for machine-readable output (used by the AI-agent skill below).
@@ -87,6 +87,8 @@ python sp500_overnight_intraday.py --tickers NVDA,MU --json
 - Uses **adjusted** prices (`auto_adjust=True`), so splits/dividends do not artificially distort overnight gaps.
 - **Survivorship bias**: we use *today's* index membership, so results are upward-biased (companies that dropped out of the S&P 500 are missing).
 - Results are **gross** — no transaction costs, taxes or slippage; executing at the exact open/close prices is not achievable in practice.
+- **Earnings and news gaps**: companies usually report outside trading hours, so a large overnight return (typical for growth stocks) can come from a few earnings-day gaps rather than a steady premium.
+- Today's **unfinished US session** is dropped automatically (a live price is not a close); the date is reported as `partial_session_dropped`.
 - Companies with different history lengths: for comparisons use `--common-start` or the annualized columns. The group tests use the *average daily* overnight return, which does not depend on history length.
 - Beta is the slope of daily close-to-close returns on SPY's over the sample window - not Yahoo's published 5-year monthly beta.
 
