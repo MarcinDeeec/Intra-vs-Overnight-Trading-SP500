@@ -24,7 +24,9 @@ Weekends and holidays are part of the overnight gap.
 - `vol_ON`, `vol_ID`, `vol_close2close`: annualized standard deviation (x sqrt(252)).
 - `beta`: slope of the company's daily close-to-close returns on SPY's, over the same window.
   Needs at least 60 overlapping days. This is *not* Yahoo's published 5-year monthly beta.
-- Companies with fewer than 20 sessions are skipped.
+- Companies with fewer sessions than `--min-days` are skipped: 500 in full scans, 20 in quick mode. Annualizing a
+  few months (recent IPOs, spin-offs) gives extreme, noisy values that would otherwise fill the top of the
+  rankings. Skipped tickers are listed in `excluded_short_history`. `n_days` shows the history actually used.
 
 ## Rankings (full scan)
 All three use `ann_diff_log` (the annualized ON-minus-ID advantage, same measure as the `dominant` label):

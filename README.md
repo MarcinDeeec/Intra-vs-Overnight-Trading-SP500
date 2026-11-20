@@ -66,6 +66,7 @@ python sp500_overnight_intraday.py --tickers NVDA,MU --json
 | `--end` | history end (default: today) |
 | `--common-start` | common window — truncate all series to this date |
 | `--topx` | ranking size (default 25) |
+| `--min-days` | minimum number of sessions per company (full scan default 500, quick mode 20); shorter histories are listed as `excluded_short_history` |
 | `--skip-meta` | skip downloading market caps (beta is always computed from prices) |
 | `--charts` | save the PNG dashboard |
 | `--limit` | limit the number of companies (debug) |
@@ -77,6 +78,7 @@ python sp500_overnight_intraday.py --tickers NVDA,MU --json
 - `sp500_on_id_all.csv` / `.parquet` — full per-company metrics
 - `rank_ON_dominates.csv`, `rank_ID_dominates.csv`, `rank_similar.csv`
 - `group_tests.csv` — statistical test results
+- `summary.json` — the `--json` summary, saved as UTF-8 (a PowerShell `>` redirect writes UTF-16)
 - `sp500_overnight_dashboard.png` — charts
 - quick mode with `--outdir`: `tickers_on_id.csv`
 
@@ -89,6 +91,7 @@ python sp500_overnight_intraday.py --tickers NVDA,MU --json
 - Results are **gross** — no transaction costs, taxes or slippage; executing at the exact open/close prices is not achievable in practice.
 - **Earnings and news gaps**: companies usually report outside trading hours, so a large overnight return (typical for growth stocks) can come from a few earnings-day gaps rather than a steady premium.
 - Today's **unfinished US session** is dropped automatically (a live price is not a close); the date is reported as `partial_session_dropped`.
+- **Short histories are excluded from scans** (`--min-days`, default 500 sessions ≈ 2 years): annualizing a few months of a recent IPO or spin-off is very noisy and such tickers otherwise dominate the top of the rankings.
 - Companies with different history lengths: for comparisons use `--common-start` or the annualized columns. The group tests use the *average daily* overnight return, which does not depend on history length.
 - Beta is the slope of daily close-to-close returns on SPY's over the sample window - not Yahoo's published 5-year monthly beta.
 
