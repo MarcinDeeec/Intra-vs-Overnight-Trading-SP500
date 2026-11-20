@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import sp500_overnight_intraday as mod  # noqa: E402
 
 
-def _series(n=300, seed=0, drift_on=0.0004, drift_id=0.0, noise=0.01):
+def _series(n=600, seed=0, drift_on=0.0004, drift_id=0.0, noise=0.01):
     """Random-walk OHLCV with a chosen average overnight/intraday drift."""
     rng = np.random.default_rng(seed)
     idx = pd.bdate_range("2022-01-03", periods=n)
@@ -242,7 +242,7 @@ def test_main_reports_dropped_session_and_beta_still_aligned(monkeypatch, capsys
     assert mod.main(["--tickers", "AAA", "--json"]) == 0
     cap = capsys.readouterr()
     payload = json.loads(cap.out)
-    last_bar = _series().index[-1]                     # synthetic data ends 2023-02-24, never "today"
+    last_bar = _series().index[-1]                     # synthetic data ends in 2024, never "today"
     assert payload["partial_session_dropped"] is None and payload["data_to"] == str(last_bar.date())
     monkeypatch.setattr(mod, "_now_et", lambda: pd.Timestamp(last_bar.date(), tz="America/New_York")
                         + pd.Timedelta(hours=11))
@@ -289,3 +289,58 @@ def test_step_numbers_are_consecutive_and_end_at_total(monkeypatch, capsys, tmp_
     steps = [ln.split("]")[0] + "]" for ln in capsys.readouterr().err.splitlines() if ln.startswith("[")]
     total = last.split("/")[1]
     assert steps == [f"[{i}/{total}" for i in range(1, len(steps) + 1)] and steps[-1] == last
+
+
+# ------------------------------------------- history length, window, summary.json
+def _fake_download_mixed(short=("T01", "T02", "T03"), short_n=150):
+    """Like _fake_download, but the given tickers only have `short_n` sessions (recent spin-offs)."""
+    def fake(tickers, start, end=None, chunk=50, pause=1.0, quiet=False):
+        out = {}
+        for i, t in enumerate(tickers):
+            n = short_n if t in short else 600
+            out[t] = _series(n=n, seed=abs(hash(t)) % 1000, drift_on=0.0006 if i % 2 else 0.0)
+        return out
+    return fake
+
+
+def test_short_histories_are_excluded_from_scans_and_listed(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(mod, "download_ohlc", _fake_download_mixed())
+    monkeypatch.setattr(mod, "get_sp500_constituents", _fake_constituents)
+    assert mod.main(["--skip-meta", "--json", "--topx", "40", "--outdir", str(tmp_path)]) == 0
+    cap = capsys.readouterr()
+    p = json.loads(cap.out)
+    assert p["min_days"] == 500 and sorted(p["excluded_short_history"]) == ["T01", "T02", "T03"]
+    assert p["n_companies"] == 37
+    ranked = {r["ticker"] for r in p["on_dominates"] + p["id_dominates"] + p["similar"]}
+    assert not ranked & {"T01", "T02", "T03"}
+    assert all(r["n_days"] >= 500 for r in p["on_dominates"])
+    assert "excluded 3 with < 500 sessions" in cap.err
+
+
+def test_min_days_flag_overrides_default_and_quick_mode_keeps_short_histories(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(mod, "download_ohlc", _fake_download_mixed())
+    monkeypatch.setattr(mod, "get_sp500_constituents", _fake_constituents)
+    assert mod.main(["--skip-meta", "--json", "--min-days", "100", "--outdir", str(tmp_path)]) == 0
+    p = json.loads(capsys.readouterr().out)
+    assert p["excluded_short_history"] == [] and p["n_companies"] == 40
+    assert mod.main(["--tickers", "T01,T05", "--json"]) == 0       # quick mode default is 20 sessions
+    q = json.loads(capsys.readouterr().out)
+    assert {r["ticker"]: r["n_days"] for r in q["results"]} == {"T01": 149, "T05": 599}
+
+
+def test_data_from_reflects_common_start(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(mod, "download_ohlc", _fake_download())
+    assert mod.main(["--tickers", "AAA", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["data_from"] == "2022-01-03"
+    assert mod.main(["--tickers", "AAA", "--json", "--common-start", "2023-01-02"]) == 0
+    assert json.loads(capsys.readouterr().out)["data_from"] == "2023-01-02"
+
+
+def test_summary_json_file_is_utf8_and_matches_stdout(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(mod, "download_ohlc", _fake_download())
+    monkeypatch.setattr(mod, "get_sp500_constituents", _fake_constituents)
+    assert mod.main(["--skip-meta", "--json", "--outdir", str(tmp_path)]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    raw = (tmp_path / "summary.json").read_bytes()
+    assert raw[:2] not in (b"\xff\xfe", b"\xfe\xff")                 # no UTF-16 BOM
+    assert json.loads(raw.decode("utf-8")) == printed and "summary.json" in printed["files"]
