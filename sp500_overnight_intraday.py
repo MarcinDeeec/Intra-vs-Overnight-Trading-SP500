@@ -4,16 +4,13 @@
 
     ON_t = Open_t / Close_{t-1} - 1        ID_t = Close_t / Open_t - 1
 
-Quick mode (a few tickers, ~seconds):
-    python sp500_overnight_intraday.py --tickers NVDA,MU,AAPL [--json]
-Full scan of the current S&P 500 (minutes):
-    python sp500_overnight_intraday.py --start 2015-01-01 --charts --outdir out
-Useful flags: --skip-meta (no market caps, faster), --limit N (smoke test),
---common-start YYYY-MM-DD, --topx N, --json (machine-readable stdout).
+Quick mode (few tickers, seconds):  python sp500_overnight_intraday.py --tickers NVDA,MU --json
+Full S&P 500 scan (about a minute): python sp500_overnight_intraday.py --charts --outdir out
+Flags: --skip-meta (no market caps), --limit N, --common-start YYYY-MM-DD, --min-days N, --topx N, --json.
 
 Needs: pip install yfinance pandas numpy scipy lxml pyarrow matplotlib
-Adjusted prices, gross returns (no costs); full scans use TODAY's constituents
-(survivorship bias). Educational analysis, not investment advice.
+Adjusted prices, gross returns; full scans use TODAY's constituents (survivorship bias).
+Educational analysis, not investment advice.
 """
 
 import argparse
@@ -34,7 +31,7 @@ UA = ("sp500-overnight-intraday/1.2 "
 SIMILAR_BAND = 0.02  # |ON - ID| < 2 pp/yr (log) is labelled "similar"
 DISCLAIMER = ("Gross returns on adjusted Yahoo Finance prices; full scans use today's "
               "S&P 500 members (survivorship bias). Educational, not investment advice.")
-RES_COLS = ["ticker", "sector", "cum_ON", "cum_ID", "ann_ON_pct", "ann_ID_pct",
+RES_COLS = ["ticker", "n_days", "sector", "cum_ON", "cum_ID", "ann_ON_pct", "ann_ID_pct",
             "ann_diff_log", "beta", "dominant"]
 
 
@@ -54,13 +51,12 @@ def fail(msg, as_json=False, code=2):
 def _fetch_url_text(url, timeout=30):
     import urllib.request
 
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
 
 def get_sp500_constituents():
-    """Return DataFrame: ticker, name, sector, sub_industry."""
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
         df = pd.read_html(io.StringIO(_fetch_url_text(url)))[0].copy()
@@ -98,7 +94,6 @@ def _extract(data, t, single):
 
 
 def download_ohlc(tickers, start, end=None, chunk=50, pause=1.0, quiet=False):
-    """Adjusted daily OHLC in batches -> dict[ticker] -> DataFrame."""
     import yfinance as yf
 
     out = {}
@@ -203,7 +198,6 @@ def fetch_market_caps(tickers, workers=8):
 
 # --- 7. Group tests ---
 def group_tests(df, value_col="mean_ON_bps"):
-    """Welch t-test + Mann-Whitney: tech / small cap / high beta vs the rest."""
     from scipy import stats
 
     results = []
@@ -252,8 +246,7 @@ def make_charts(res, path):
         ax.set_ylabel("Annual ON-minus-ID advantage (log)")
 
     fig, ax = plt.subplots(2, 2, figsize=(15, 11))
-    fig.suptitle("S&P 500: overnight (ON) vs intraday (ID) decomposition - per-company annualization",
-                 fontsize=14, fontweight="bold")
+    fig.suptitle("S&P 500: overnight (ON) vs intraday (ID) returns", fontsize=14, fontweight="bold")
     a = ax[0, 0]
     a.hist(df.ann_ON_pct.clip(-20, 60), bins=40, alpha=0.6, label="Overnight (ON)", color="#2c7fb8")
     a.hist(df.ann_ID_pct.clip(-20, 60), bins=40, alpha=0.6, label="Intraday (ID)", color="#de2d26")
@@ -315,38 +308,45 @@ def _drop_open_session(ohlc, now=None):
     return out, dropped
 
 
-def _window(ohlc):
+def _window(ohlc, common_start=None):
     idx = [df.index for df in ohlc.values()]
-    return {"data_from": str(min(i.min() for i in idx).date()),
-            "data_to": str(max(i.max() for i in idx).date())}
+    lo = min(i.min() for i in idx)
+    if common_start:
+        lo = max(lo, pd.Timestamp(common_start))
+    return {"data_from": str(lo.date()), "data_to": str(max(i.max() for i in idx).date())}
 
 
-def _compute_all(ohlc, mkt_ret, common_start):
-    rows = []
+def _compute_all(ohlc, mkt_ret, common_start, min_days=20):
+    """-> (DataFrame of per-company metrics, tickers dropped for a too-short history)."""
+    rows, short = [], []
     for t, df in ohlc.items():
         if common_start:
             df = df[df.index >= pd.Timestamp(common_start)]
             if len(df) < 21:
                 continue
         s = summarize_ticker(t, compute_on_id(df), mkt_ret)
-        if s:
+        if s and s["n_days"] >= min_days:
             rows.append(s)
-    return pd.DataFrame(rows)
+        elif s:
+            short.append(t)
+    return pd.DataFrame(rows), short
 
 
 # --- Main ---
 def build_parser():
     ap = argparse.ArgumentParser(description="S&P 500 overnight vs intraday decomposition")
-    ap.add_argument("--tickers", default=None, help="comma-separated tickers (quick mode, skips the full scan)")
+    ap.add_argument("--tickers", default=None, help="comma-separated tickers (quick mode)")
     ap.add_argument("--start", default="2015-01-01")
     ap.add_argument("--end", default=None)
     ap.add_argument("--topx", type=int, default=25)
-    ap.add_argument("--outdir", default=None, help="output dir (full scan default: out; quick mode: no files)")
+    ap.add_argument("--outdir", default=None, help="output dir (scan default: out; quick: none)")
     ap.add_argument("--skip-meta", action="store_true", help="skip downloading market caps")
-    ap.add_argument("--common-start", default=None, help="truncate all series to this date (YYYY-MM-DD)")
-    ap.add_argument("--charts", action="store_true", help="save PNG dashboard (full scan)")
-    ap.add_argument("--limit", type=int, default=None, help="limit number of companies (debug)")
-    ap.add_argument("--json", action="store_true", help="print a compact JSON summary to stdout")
+    ap.add_argument("--common-start", default=None, help="truncate all series to this date")
+    ap.add_argument("--min-days", type=int, default=None,
+                    help="min sessions per company (scan 500, quick 20)")
+    ap.add_argument("--charts", action="store_true", help="save PNG dashboard")
+    ap.add_argument("--limit", type=int, default=None, help="limit number of companies")
+    ap.add_argument("--json", action="store_true", help="compact JSON summary on stdout")
     return ap
 
 
@@ -394,10 +394,14 @@ def main(argv=None):
         log("      (SPY unavailable: beta will be empty)")
 
     step("Computing ON / ID ...")
-    res = _compute_all(ohlc, mkt_ret, args.common_start)
+    min_days = args.min_days if args.min_days is not None else (20 if quick else 500)
+    res, short = _compute_all(ohlc, mkt_ret, args.common_start, min_days)
+    if short:
+        log(f"      excluded {len(short)} with < {min_days} sessions (recent IPOs/spin-offs): "
+            f"{', '.join(short[:10])}{' ...' if len(short) > 10 else ''}")
     if res.empty:
-        fail("no ticker had enough history (need >= 20 sessions)", args.json)
-    meta = {**_window(ohlc), "partial_session_dropped": partial}
+        fail(f"no ticker had enough history (need >= {min_days} sessions)", args.json)
+    meta = {**_window(ohlc, args.common_start), "partial_session_dropped": partial}
 
     if quick:
         res = res.sort_values("ann_diff_log", ascending=False)
@@ -461,15 +465,20 @@ def main(argv=None):
             log(f"      (charts skipped: {e})")
 
     if args.json:
-        print(json.dumps({
+        files["summary.json"] = None
+        text = json.dumps({
             "mode": "scan", **meta, "n_companies": len(res), "missing_count": len(missing),
+            "excluded_short_history": short, "min_days": min_days,
             "median_ann_ON_pct": _num(res["ann_ON_pct"].median()),
             "median_ann_ID_pct": _num(res["ann_ID_pct"].median()),
             "on_dominates": to_records(on_dom), "id_dominates": to_records(id_dom),
             "similar": to_records(similar),
             "group_tests": to_records(tests, list(tests.columns)) if not tests.empty else [],
             "group_tests_note": note,
-            "outdir": od, "files": sorted(files), "disclaimer": DISCLAIMER}, indent=1))
+            "outdir": od, "files": sorted(files), "disclaimer": DISCLAIMER}, indent=1)
+        with open(os.path.join(od, "summary.json"), "w", encoding="utf-8") as f:
+            f.write(text)
+        print(text)
     else:
         pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
         cols = ["ticker", "sector", "cum_ON", "cum_ID", "ann_diff_log", "vol_close2close"]

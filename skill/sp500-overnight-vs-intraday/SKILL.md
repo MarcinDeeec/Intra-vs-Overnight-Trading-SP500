@@ -48,10 +48,14 @@ Downloads ~500 tickers and takes minutes, so:
 
 ```bash
 python sp500_overnight_intraday.py --start 2015-01-01 --common-start 2016-01-01 \
-  --topx 25 --charts --outdir out --json > scan.json
+  --topx 25 --charts --outdir out --json
 ```
 
-Add `--skip-meta` to skip market caps (faster; the small-cap test is then skipped, the beta
+It took under a minute for ~500 tickers in a live test. The same JSON is saved as UTF-8 to `out/summary.json`;
+read that file instead of redirecting stdout (on Windows PowerShell `>` writes UTF-16, which JSON parsers reject).
+
+Companies with fewer than 500 sessions (recent IPOs and spin-offs) are left out of scans because their annualized
+figures are too noisy; change this with `--min-days`. Add `--skip-meta` to skip market caps (faster; the small-cap test is then skipped, the beta
 test still runs). Use `--common-start` when comparing companies fairly across the same window.
 Progress and warnings go to stderr; with `--json` stdout is a single JSON document.
 
@@ -68,8 +72,10 @@ Scan JSON: `on_dominates`, `id_dominates`, `similar` (top-N lists, ranked by `an
 ON-minus-ID advantage, so history length does not matter), `group_tests` (tech, small cap,
 high beta vs the rest: Welch and Mann-Whitney p-values on the mean daily overnight return;
 if empty, `group_tests_note` says why, usually a scan that was too small),
-`median_ann_ON_pct` / `median_ann_ID_pct`, `n_companies`, and `files` written to `outdir`
-(CSV/Parquet, and `sp500_overnight_dashboard.png` with `--charts`).
+`median_ann_ON_pct` / `median_ann_ID_pct`, `n_companies`, `excluded_short_history` (tickers skipped for
+having too few sessions) and `files` written to `outdir` (CSV/Parquet, `summary.json`, and
+`sp500_overnight_dashboard.png` with `--charts`). Each record has `n_days`: say so when a result rests on a short history.
+`data_from` is the first date actually used (it follows `--common-start`).
 
 ## 4. Report it honestly
 
